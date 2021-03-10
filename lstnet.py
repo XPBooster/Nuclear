@@ -1,4 +1,3 @@
-import re
 import pandas as pd
 import torch
 import torch.nn as nn
@@ -12,6 +11,7 @@ from sklearn.base import BaseEstimator, RegressorMixin
 import torch.nn.functional as F
 from Optim import Optim
 import argparse
+from sklearn.metrics import mean_absolute_error, explained_variance_score, mean_squared_error, median_absolute_error, r2_score
 
 
 class Data(Dataset):
@@ -90,7 +90,6 @@ class LSTNet(nn.Module):
     def __init__(self, args, feature_num):
 
         super(LSTNet, self).__init__()
-        self.use_cuda = args.cuda
         self.P = args.window
         self.m = feature_num
         self.hidR = args.hidRNN
@@ -170,25 +169,31 @@ class LSTNetModel(BaseEstimator, RegressorMixin):
         # Parameter Assignment
         self.train_set = Data(args, mode='train')
         self.valid_set = Data(args, mode='valid', scaler=self.train_set.scaler)
-
+        self.epoch = 0
         self.n_epoch = args.epochs
         self.batch_size = args.batch_size
         self.lr = args.lr
-        self.loss_hist = []
         self.input_dim = self.train_set.raw_dat.shape[1]
         self.criterion = nn.L1Loss(size_average=False) if args.L1Loss else nn.MSELoss(size_average=False)
         self.model = LSTNet(args, self.input_dim).to(args.device)
         self.optimizer = Optim(self.model.parameters(), args.optim, args.lr, args.clip)
         # self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size, gamma)
         self.criterion = nn.MSELoss(reduction='sum')
-
+        
+        self.eval = dict()
+        self.eval['loss'] = []
+        self.eval['mean_absolute_error'] = []
+        self.eval['explained_variance_score'] = []
+        self.eval['mean_squared_error'] = []
+        self.eval['median_absolute_error'] = []
+        self.eval['r2_score'] = []
 
     def fit(self):
 
         self.model.train()
         for i in range(self.n_epoch):
 
-            self.loss_hist.append(0)
+            self.eval['loss'].append(0)
             train_loader = DataLoader(dataset=self.train_set, batch_size=self.batch_size, shuffle=True)
             
             idx = 0
@@ -197,52 +202,55 @@ class LSTNetModel(BaseEstimator, RegressorMixin):
                 self.model.zero_grad()
                 output = self.model(batch_X)
                 loss = self.criterion(output, batch_y) # shape
-                self.loss_hist[-1] += loss.item()
-                # print(output.shape, batch_y.shape)
-                # print(loss)
+                self.eval['loss'][-1] += loss.item()
                 loss.backward()
                 self.optimizer.step()
                 idx += 1
 
             # self.scheduler.step()
-
-            print('Epoch: {}, Loss: {}'.format(i + 1, self.loss_hist[-1]/idx/args.batch_size/self.input_dim))
-
+            self.epoch += 1
+            print('Epoch: {}, Loss: {}'.format(self.epoch + 1, self.eval['loss'][-1]/idx/args.batch_size/self.input_dim))
+            
         print('Optimization finished!')
 
 
     def valid(self):
 
-        self.model.eval()
+        with torch.no_grad():
+            self.model.eval()
 
-        batchy_list = torch.tensor([], )
-        valid_loader = DataLoader(dataset=self.valid_set, batch_size=self.batch_size, shuffle=True)
-        loss_valid = 0
-        idx = 0
-        for batch_X, batch_y in valid_loader:
+            batchy_list = torch.tensor([], dtype=torch.float32, device=args.device)
+            output_list = torch.tensor([], dtype=torch.float32, device=args.device)
+            valid_loader = DataLoader(dataset=self.valid_set, batch_size=self.batch_size, shuffle=True)
+            loss_valid = 0
+            idx = 0
 
-            self.model.zero_grad()
-            output = self.model(batch_X)
-            loss = self.criterion(output, batch_y) # shape
-            loss_valid += loss.item()
-            idx += 1
+            for batch_X, batch_y in valid_loader:
 
-        print('Valid Loss: {}'.format(loss_valid/idx/args.batch_size/self.input_dim))
+                self.model.zero_grad()
+                output = self.model(batch_X)
+                loss = self.criterion(output, batch_y) # shape
+                loss_valid += loss.item()
 
-        print('Optimization finished!')
-    # # Test
-    # def predict(self, X):
-    #     X = torch.tensor(self.scaler_X.transform(X), dtype=torch.float32, device=self.gpu).unsqueeze(1)
-    #     self.model.eval()
-    #     y = self.scaler_y.inverse_transform(self.model(X).detach().cpu().numpy())
+                batchy_list = torch.cat((batchy_list, batch_y), axis=0)
+                output_list = torch.cat((output_list, output), axis=0)
+                idx += 1
 
-    #     return y
+            batchy_list = batchy_list.cpu()
+            output_list = output_list.cpu()
+            self.eval['mean_squared_error'].append(mean_squared_error(batchy_list,output_list, multioutput='raw_values'))
+            self.eval['mean_absolute_error'].append(mean_absolute_error(batchy_list, output_list, multioutput='raw_values'))
+            self.eval['median_absolute_error'].append(median_absolute_error(batchy_list, output_list, multioutput='raw_values'))
+            self.eval['explained_variance_score'].append(explained_variance_score(batchy_list, output_list, multioutput='raw_values'))
+            self.eval['r2_score'].append(r2_score(batchy_list, output_list, multioutput='raw_values'))
+
+        print('Epoch: {}, Valid Loss: {}'.format(self.epoch, np.array(self.eval['mean_squared_error']).mean(axis=1)))
+
 
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser(description='PyTorch Time series forecasting')
-    parser.add_argument('--data', type=str, default='./data/0201A13-白城工业园区站.txt',
-                        help='location of the data file')
+    parser.add_argument('--data', type=str, default='./data/test.txt', help='location of the data file')
     # parser.add_argument('--data', type=str, default='./data/traffic.txt',
     #                     help='location of the data file')
     parser.add_argument('--model', type=str, default='LSTNet', help='')
@@ -251,25 +259,16 @@ if __name__ == '__main__':
     parser.add_argument('--hidCNN', type=int, default=100, help='number of CNN hidden units')
     parser.add_argument('--hidRNN', type=int, default=100, help='number of RNN hidden units')
     parser.add_argument('--window', type=int, default=24 * 7, help='window size')
-    parser.add_argument('--CNN_kernel', type=int, default=6,
-                        help='the kernel size of the CNN layers')
-    parser.add_argument('--highway_window', type=int, default=24,
-                        help='The window size of the highway component')
+    parser.add_argument('--CNN_kernel', type=int, default=6,)
+    parser.add_argument('--highway_window', type=int, default=24, help='The window size of the highway component')
     parser.add_argument('--clip', type=float, default=10., help='gradient clipping')
-    parser.add_argument('--epochs', type=int, default=10,
-                        help='upper epoch limit')
-    parser.add_argument('--batch_size', type=int, default=64, metavar='N',
-                        help='batch size')
-    parser.add_argument('--dropout', type=float, default=0.1,
-                        help='dropout applied to layers (0 = no dropout)')
-    parser.add_argument('--seed', type=int, default=54321,
-                        help='random seed')
+    parser.add_argument('--epochs', type=int, default=10)
+    parser.add_argument('--batch_size', type=int, default=64, metavar='N')
+    parser.add_argument('--dropout', type=float, default=0.1, help='(0 = no dropout)')
+    parser.add_argument('--seed', type=int, default=54321,)
     parser.add_argument('--device', default=torch.device("cuda:0"))
-    parser.add_argument('--log_interval', type=int, default=2000, metavar='N',
-                        help='report interval')
-    parser.add_argument('--save', type=str,  default='log.log',
-                        help='path to save the final model')
-    parser.add_argument('--cuda', type=str, default=True)
+    parser.add_argument('--log_interval', type=int, default=2000, metavar='N', help='report interval')
+    parser.add_argument('--save', type=str,  default='log.log', help='path to save the results')
     parser.add_argument('--optim', type=str, default='adam')
     parser.add_argument('--lr', type=float, default=0.001)
     parser.add_argument('--horizon', type=int, default=1)
@@ -283,3 +282,5 @@ if __name__ == '__main__':
     model = LSTNetModel(args)
     model.fit()
     model.valid()
+    np.savetxt('loss.txt', model.eval['loss'])
+    np.savetxt('r2.txt', model.eval['r2_score'])
